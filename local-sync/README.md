@@ -39,7 +39,7 @@ GitHub 无法主动推文件到你电脑 —— 你关机时没有程序在监�
   "repo": "你的用户名/你的仓库名",
   "branch": "main",
   "remotePath": "history/buddy-ledger.xlsx",
-  "localDir": "C:/Users/Administrator/Desktop/Buddy加油站台账",
+  "localDir": "C:/Users/Administrator/Desktop",
   "localName": "Buddy加油站台账.xlsx",
   "autoOpen": true
 }
