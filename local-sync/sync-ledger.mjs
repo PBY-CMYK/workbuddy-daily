@@ -281,17 +281,50 @@ async function saveBuffer(cfg, buf, url) {
   return { ok: true, dest, changed: true, size: buf.length, url };
 }
 
+/** 展开 REG_EXPAND_SZ 值里的 %ENV%（reg query 输出的是未展开形式） */
+function expandEnv(p) {
+  return p.replace(/%([^%]+)%/g, (m, n) => process.env[n] || m);
+}
+
 /**
- * 找本地表格程序（Excel 优先，其次 WPS）。
- * 不依赖 .xlsx 的 shell 关联——关联可能被接管/损坏（2026-10-01 实测：
- * `start` 返回成功但表格不弹，而资源管理器双击正常）。
+ * 查注册表 App Paths（HKLM 优先于 HKCU）拿程序真实路径。
+ * App Paths 是 Windows 官方机制，覆盖 MSI(2007~2016) / C2R(2013~2024) / 商店版
+ * 的 excel.exe，以及 WPS 的 et.exe——比固定路径探测通用得多。
  */
-function findSpreadsheetApp() {
+function appPathsLookup(exe) {
+  const hives = ['HKLM', 'HKCU'].map(
+    (h) => `${h}\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\${exe}`
+  );
+  return new Promise((resolve) => {
+    let i = 0;
+    const next = () => {
+      if (i >= hives.length) return resolve(null);
+      execFile('reg', ['query', hives[i++], '/ve'], { windowsHide: true }, (e, so) => {
+        if (!e && so) {
+          const line = so.split(/\r?\n/).find((l) => /REG_(?:EXPAND_)?SZ/i.test(l));
+          if (line) {
+            const val = line.replace(/^.*?REG_(?:EXPAND_)?SZ\s+/i, '').trim().replace(/^"|"$/g, '');
+            if (val) return resolve(expandEnv(val));
+          }
+        }
+        next();
+      });
+    };
+    next();
+  });
+}
+
+/** 本地候选路径兜底（注册表查不到时用）：Office 14/15/16 的 C2R 与 MSI 布局 + WPS */
+function findSpreadsheetAppSync() {
   const cands = [
     'C:/Program Files/Microsoft Office/root/Office16/EXCEL.EXE',
     'C:/Program Files (x86)/Microsoft Office/root/Office16/EXCEL.EXE',
     'C:/Program Files/Microsoft Office/Office16/EXCEL.EXE',
     'C:/Program Files (x86)/Microsoft Office/Office16/EXCEL.EXE',
+    'C:/Program Files/Microsoft Office/root/Office15/EXCEL.EXE',
+    'C:/Program Files/Microsoft Office/Office15/EXCEL.EXE',
+    'C:/Program Files/Microsoft Office/root/Office14/EXCEL.EXE',
+    'C:/Program Files/Microsoft Office/Office14/EXCEL.EXE',
     path.join(process.env.LOCALAPPDATA || '', 'Kingsoft/WPS Office/office6/et.exe'),
     'C:/Program Files/Kingsoft/WPS Office/office6/et.exe',
     'C:/Program Files (x86)/Kingsoft/WPS Office/office6/et.exe',
@@ -299,20 +332,33 @@ function findSpreadsheetApp() {
   return cands.find((p) => p && fs.existsSync(p)) || null;
 }
 
-/** 打开台账：优先直接启动 Excel/WPS，找不到时退回系统默认关联 */
-function openFile(p) {
-  try {
-    const app = findSpreadsheetApp();
-    if (app) {
-      // detached + unref：Excel 独立运行，不拖住 sync 进程
-      spawn(app, [p], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
-      return;
-    }
-    // start 是 cmd 内置命令，需要 shell（兜底路径）
-    execFile('cmd', ['/c', 'start', '""', p], { windowsHide: true }, () => {});
-  } catch {
-    /* 打开失败不影响同步 */
+/** 找本地表格程序：App Paths 注册表优先，其次固定路径，Excel 优先于 WPS */
+async function findSpreadsheetApp() {
+  for (const exe of ['excel.exe', 'et.exe']) {
+    const hit = await appPathsLookup(exe);
+    if (hit && fs.existsSync(hit)) return hit;
   }
+  return findSpreadsheetAppSync();
+}
+
+/**
+ * 打开台账：直接启动 Excel/WPS（绕过 .xlsx 的 shell 关联——关联可能被接管/损坏，
+ * 2026-10-01 实测 start 返回成功但表格不弹）；找不到本地程序才退回系统默认关联。
+ */
+function openFile(p) {
+  findSpreadsheetApp()
+    .then((app) => {
+      if (app) {
+        // detached + unref：Excel 独立运行，不拖住 sync 进程
+        spawn(app, [p], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+        return;
+      }
+      // start 是 cmd 内置命令，需要 shell（兜底路径）
+      execFile('cmd', ['/c', 'start', '""', p], { windowsHide: true }, () => {});
+    })
+    .catch(() => {
+      /* 打开失败不影响同步 */
+    });
 }
 
 // ---------------------------------------------------------------------------
