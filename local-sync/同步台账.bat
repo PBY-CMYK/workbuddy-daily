@@ -44,7 +44,7 @@ goto OTHER
 
 :OK
 echo [DONE] Ledger updated.
-echo        Location: %USERPROFILE%\Desktop\Buddy Ledger\
+echo        See the file path printed above.
 goto END
 
 :WARN
