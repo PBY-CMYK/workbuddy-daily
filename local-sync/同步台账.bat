@@ -44,8 +44,10 @@ goto OTHER
 
 :OK
 echo [DONE] Ledger updated.
-echo        See the file path printed above.
-goto END
+echo        The table is opened. This window will close automatically.
+REM ping 3 times ~= 2s delay; works even when stdin is redirected (timeout would error out)
+ping -n 3 127.0.0.1 >nul
+exit /b 0
 
 :WARN
 echo [NOT DONE] See messages above.
@@ -68,6 +70,6 @@ goto END
 
 :END
 echo.
-echo Press any key to close ...
+echo [FAILED] Press any key to close ...
 pause >nul
 endlocal
