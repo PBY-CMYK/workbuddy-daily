@@ -345,20 +345,24 @@ async function findSpreadsheetApp() {
  * 打开台账：直接启动 Excel/WPS（绕过 .xlsx 的 shell 关联——关联可能被接管/损坏，
  * 2026-10-01 实测 start 返回成功但表格不弹）；找不到本地程序才退回系统默认关联。
  */
-function openFile(p) {
-  findSpreadsheetApp()
-    .then((app) => {
-      if (app) {
-        // detached + unref：Excel 独立运行，不拖住 sync 进程
-        spawn(app, [p], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
-        return;
-      }
-      // start 是 cmd 内置命令，需要 shell（兜底路径）
-      execFile('cmd', ['/c', 'start', '""', p], { windowsHide: true }, () => {});
-    })
-    .catch(() => {
-      /* 打开失败不影响同步 */
-    });
+/** 打开台账（异步：调用方必须 await——脚本末尾 process.exit(0) 不会等未完成的 Promise）。
+ *  任何失败都不抛出——打开表格只是锦上添花，绝不能影响同步退出码。 */
+async function openFile(p) {
+  try {
+    const app = await findSpreadsheetApp();
+    if (app) {
+      // detached + unref：Excel 独立运行，不拖住 sync 进程；
+      // on('error') 兜住 spawn 本身的失败（路径失效/被安全软件拦截等），防进程崩溃
+      const child = spawn(app, [p], { detached: true, stdio: 'ignore', windowsHide: false });
+      child.on('error', () => {});
+      child.unref();
+      return;
+    }
+    // start 是 cmd 内置命令，需要 shell（兜底路径）
+    execFile('cmd', ['/c', 'start', '""', p], { windowsHide: true }, () => {});
+  } catch {
+    /* 打开失败不影响同步 */
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,7 +443,11 @@ async function main() {
 
   if (cfg.autoOpen && !NO_OPEN) {
     log('[sync] 打开表格……');
-    openFile(r.dest);
+    try {
+      await openFile(r.dest);
+    } catch {
+      /* 双保险：打开失败绝不影响同步退出码 */
+    }
   }
 }
 
