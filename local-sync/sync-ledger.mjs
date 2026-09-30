@@ -419,10 +419,11 @@ async function fetchCreditRemain(t) {
 }
 
 /**
- * 刷新台账底部小结区的「今日已用 / 还剩积分」：
- *   还剩积分   ← 实时余额（get-user-resource-summary 汇总）
- *   今日已用   ← 上次快照还剩 - 当前还剩（本地不签到，消耗只会让余额变小；
- *                 差值为负说明中间有别的入账，按 0 处理）
+ * 刷新 K 列小结区的「今日已用 / 还剩积分」（K1=累计总积分、K2=今日已用、K3=还剩积分）：
+ *   还剩积分(L3) ← 实时余额（get-user-resource-summary 汇总）
+ *   今日已用(L2) ← 上次快照还剩 - 当前还剩（本地不签到，消耗只会让余额变小；
+ *                  差值为负说明中间有别的入账，按 0 处理）
+ * 兼容旧版 A 列底部小结（s=累计总积分行 → s+1/s+2 的 B 列）。
  * 任何一步失败都只提示、不阻断（台账本身已经同步成功了）。
  */
 async function refreshSummaryRows(dest) {
@@ -446,21 +447,27 @@ async function refreshSummaryRows(dest) {
     const ws = wb.getWorksheet('每日记录');
     if (!ws) return;
 
-    // 找小结区（A 列 = 「累计总积分」）
-    let s = -1;
-    for (let i = 2; i <= ws.rowCount; i++) {
-      if (String(ws.getRow(i).getCell(1).value ?? '').trim() === '累计总积分') { s = i; break; }
-    }
-    if (s < 0) {
-      log('[sync] 台账里没有积分小结区，跳过刷新');
-      return;
+    // 定位小结：新版 K 列优先，旧版 A 列底部兜底
+    let usedCell, remainCell;
+    if (String(ws.getCell('K1').value ?? '').trim() === '累计总积分') {
+      usedCell = ws.getCell('L2');
+      remainCell = ws.getCell('L3');
+    } else {
+      let s = -1;
+      for (let i = 2; i <= ws.rowCount; i++) {
+        if (String(ws.getRow(i).getCell(1).value ?? '').trim() === '累计总积分') { s = i; break; }
+      }
+      if (s < 0) {
+        log('[sync] 台账里没有积分小结区，跳过刷新');
+        return;
+      }
+      remainCell = ws.getRow(s + 2).getCell(2);
+      usedCell = ws.getRow(s + 1).getCell(2);
     }
 
-    // 布局：s=累计总积分，s+1=今日已用，s+2=还剩积分
-    const remainCell = ws.getRow(s + 2).getCell(2);
-    const usedCell = ws.getRow(s + 1).getCell(2);
-
-    const oldRemain = Number(remainCell.value);
+    // 旧值是「—」/空时不推算今日已用，只刷新还剩
+    const raw = remainCell.value;
+    const oldRemain = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
     let usedText = usedCell.value;
     if (Number.isFinite(oldRemain)) {
       const used = Math.max(0, Math.round((oldRemain - sum.remain) * 100) / 100);
