@@ -18,7 +18,7 @@
  *     "repo":  "用户名/仓库名",
  *     "branch": "main",
  *     "remotePath": "history/buddy-ledger.xlsx",
- *     "localDir":  "C:/Users/Administrator/Desktop/Buddy加油站台账",
+ *     "localDir":  "C:/Users/Administrator/Desktop",
  *     "localName": "Buddy加油站台账.xlsx",
  *     "autoOpen":  true
  *   }
@@ -52,7 +52,7 @@ const DEFAULTS = {
   repo: 'YOUR_NAME/YOUR_REPO',
   branch: 'main',
   remotePath: 'history/buddy-ledger.xlsx',
-  localDir: path.join(process.env.USERPROFILE || process.env.HOME || '.', 'Desktop', 'Buddy加油站台账'),
+  localDir: path.join(process.env.USERPROFILE || process.env.HOME || '.', 'Desktop'),
   localName: 'Buddy加油站台账.xlsx',
   autoOpen: true,
 };
