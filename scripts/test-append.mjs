@@ -31,7 +31,7 @@ async function readLedger(file) {
   const sheets = wb.worksheets.map((s) => s.name);
   const cell = (r, c) => ws.getRow(r)?.getCell(c)?.value ?? null;
   const rows = [];
-  let summary = null;
+  let legacyLabelRow = -1;
   for (let i = 2; i <= ws.rowCount; i++) {
     const a = String(cell(i, 1) ?? '');
     if (/^\d{4}-\d{2}-\d{2}$/.test(a)) {
@@ -43,9 +43,17 @@ async function readLedger(file) {
         dispatch: String(cell(i, 8) ?? ''), dispatchNote: String(cell(i, 9) ?? ''),
       });
     }
-    if (a === '累计总积分') summary = { totalRow: i, usedRow: i + 1, remainRow: i + 2 };
+    if (a === '累计总积分') legacyLabelRow = i;
   }
-  return { ws, sheets, cell, rows, summary, rowCount: ws.rowCount };
+  // 小结定位：优先新版 K1:L3（K1 = 第1行第11列，值在 L 列 = 第12列）；
+  // 兼容旧版 A 列底部小结（值在 B 列 = 第2列）
+  let summary = null;
+  if (String(cell(1, 11) ?? '').trim() === '累计总积分') {
+    summary = { totalRow: 1, usedRow: 2, remainRow: 3, valCol: 12 };
+  } else if (legacyLabelRow > 0) {
+    summary = { totalRow: legacyLabelRow, usedRow: legacyLabelRow + 1, remainRow: legacyLabelRow + 2, valCol: 2 };
+  }
+  return { ws, sheets, cell, rows, summary, legacyLabelRow, rowCount: ws.rowCount };
 }
 
 async function runAppend(resultObj, ledgerFile) {
@@ -57,6 +65,31 @@ async function runAppend(resultObj, ledgerFile) {
   });
   if (rr.status !== 0) throw new Error(`append-ledger 退出码 ${rr.status}\n${rr.stdout}\n${rr.stderr}`);
   return rr.stdout;
+}
+
+/** 把 K 列小结种子改造成「旧版 A 列底部小结」文件（场景 D 输入） */
+async function makeLegacySeed(src, dest) {
+  fs.copyFileSync(src, dest);
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.readFile(dest);
+  const ws = wb.getWorksheet('每日记录');
+  // 数据末行：从底往上按 A 列日期找（不能用 rowCount —— K 列小结会把它撑到 3）
+  let last = 1;
+  for (let i = ws.rowCount; i >= 2; i--) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(String(ws.getRow(i).getCell(1).value ?? '').trim())) { last = i; break; }
+  }
+  for (const addr of ['K1', 'L1', 'K2', 'L2', 'K3', 'L3']) {
+    const c = ws.getCell(addr);
+    c.value = null;
+    c.style = {};
+  }
+  ws.getRow(last + 2).getCell(1).value = '累计总积分';
+  ws.getRow(last + 2).getCell(2).value = { formula: `SUM(G2:G${last})` };
+  ws.getRow(last + 3).getCell(1).value = '今日已用';
+  ws.getRow(last + 3).getCell(2).value = 25.92;
+  ws.getRow(last + 4).getCell(1).value = '还剩积分';
+  ws.getRow(last + 4).getCell(2).value = 1653.15;
+  await wb.xlsx.writeFile(dest);
 }
 
 const base = (over = {}) => ({
@@ -102,8 +135,9 @@ console.log('\n场景 A：重复签到跳过 + 领奖失败 → 原 ✅ 行必�
   check('到家积分保持 5', Number(row?.claimCredits) === 5, String(row?.claimCredits));
   check('当日总积分保持 105', Number(row?.totalCredits) === 105, String(row?.totalCredits));
   check('派猫说明保留原文', row?.dispatchNote?.includes('咖啡馆'), String(row?.dispatchNote));
-  const remain = Number(L.cell(L.summary.remainRow, 2));
-  const used = Number(L.cell(L.summary.usedRow, 2));
+  check('K 列小结区存在', !!L.summary && L.summary.valCol === 12, JSON.stringify(L.summary));
+  const remain = Number(L.cell(L.summary.remainRow, L.summary.valCol));
+  const used = Number(L.cell(L.summary.usedRow, L.summary.valCol));
   check('还剩积分=1679.07', remain === 1679.07, String(remain));
   check('今日已用=0', used === 0, String(used));
   check('无「汇总」表', !L.sheets.includes('汇总'), L.sheets.join(','));
@@ -145,13 +179,36 @@ console.log('\n场景 C：次日签到 100+5、白天已消费 210 → 今日已
   check('新行 ✅ 100 / ✅ 5 / 105',
     r2?.checkin === '✅' && Number(r2?.checkinCredits) === 100 && Number(r2?.claimCredits) === 5 && Number(r2?.totalCredits) === 105,
     JSON.stringify(r2));
-  const used = Number(L.cell(L.summary.usedRow, 2));
-  const remain = Number(L.cell(L.summary.remainRow, 2));
+  const used = Number(L.cell(L.summary.usedRow, L.summary.valCol));
+  const remain = Number(L.cell(L.summary.remainRow, L.summary.valCol));
   check('今日已用=210（快照差值）', used === 210, String(used));
   check('还剩积分=1574.07', remain === 1574.07, String(remain));
-  const totalCell = L.cell(L.summary.totalRow, 2);
+  const totalCell = L.cell(L.summary.totalRow, L.summary.valCol);
   const totalVal = totalCell?.formula ? 'SUM公式' : String(totalCell);
   check('累计总积分是 SUM 公式', totalVal === 'SUM公式', totalVal);
+}
+
+// ============ 场景 D：旧版 A 列底部小结 → 自动迁移 K1:L3 ============
+console.log('\n场景 D：旧版 A 列底部小结 → 自动迁移 K 列（行数不变、K1:L3 重建）');
+{
+  const f = path.join(TMP, 'D.xlsx');
+  await makeLegacySeed(SEED, f);
+  await runAppend(base({
+    finishedAt: '2026-10-01T16:20:00Z',
+    checkin: { attempted: true, ok: true, alreadyCheckedIn: false, note: '签到成功，获得 100 积分', credits: 100, raw: null },
+    credit: { attempted: true, ok: true, total: 3505, remain: 1548.15, used: 2057.93, unit: 'credits', raw: null },
+  }), f);
+  const L = await readLedger(f);
+  check('行数=2', L.rows.length === 2, `实际 ${L.rows.length}`);
+  check('旧 A 列小结已删除', L.legacyLabelRow === -1, `legacyLabelRow=${L.legacyLabelRow}`);
+  check('K1=累计总积分', String(L.cell(1, 11) ?? '').trim() === '累计总积分', String(L.cell(1, 11)));
+  check('K 列小结区存在', !!L.summary && L.summary.valCol === 12, JSON.stringify(L.summary));
+  const used = Number(L.cell(L.summary.usedRow, L.summary.valCol));
+  const remain = Number(L.cell(L.summary.remainRow, L.summary.valCol));
+  check('今日已用=210（1653.15+105-1548.15）', used === 210, String(used));
+  check('还剩积分=1548.15', remain === 1548.15, String(remain));
+  const totalCell = L.cell(1, 12);
+  check('累计总积分是 SUM 公式', totalCell?.formula === 'SUM(G2:G3)', JSON.stringify(totalCell));
 }
 
 console.log(`\n===== 结果：${pass} 通过 / ${fail} 失败 =====`);
