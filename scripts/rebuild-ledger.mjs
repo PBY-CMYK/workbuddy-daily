@@ -3,7 +3,7 @@
  * 一次性重建修复版台账（history/buddy-ledger.xlsx）：
  *   - 「每日记录」10 列新结构
  *   - 从 git 历史找回的 2026-10-01 00:16 ✅ 好行
- *   - 底部小结三行：累计总积分(SUM公式) / 今日已用 / 还剩积分
+ *   - K 列小结三行（K1:L3 右上角固定）：累计总积分(SUM公式) / 今日已用 / 还剩积分
  *   - 无「汇总」表
  *
  * 用法：node scripts/rebuild-ledger.mjs <输出.xlsx> [remain]
@@ -64,24 +64,29 @@ for (const c of [4, 5, 6, 7]) r.getCell(c).alignment = { horizontal: 'center', v
 r.getCell(7).font = { bold: true };
 r.getCell(2).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF7F9FC' } };
 
-// ---- 底部小结 -----------------------------------------------------------
-const mk = (rowNo, label, value, accent = false) => {
-  const row = ws.getRow(rowNo);
-  row.getCell(1).value = label;
-  row.getCell(2).value = value;
-  row.getCell(1).font = { bold: true };
-  row.getCell(2).font = accent
+// ---- 小结区（K1:L3 固定右上角；K1/L1 并入表头蓝带） ---------------------
+const white = { bold: true, color: { argb: 'FFFFFFFF' } };
+const mk = (labelCell, valueCell, label, value, accent = false) => {
+  labelCell.value = label;
+  valueCell.value = value;
+  labelCell.font = white;
+  labelCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2F5597' } };
+  labelCell.alignment = { horizontal: 'center', vertical: 'middle' };
+  valueCell.font = accent
     ? { bold: true, size: 13, color: { argb: 'FFC00000' } }
     : { bold: true };
-  row.getCell(2).alignment = { horizontal: 'left', vertical: 'middle' };
+  valueCell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2F5597' } };
+  valueCell.alignment = { horizontal: 'left', vertical: 'middle' };
 };
 
-mk(4, '累计总积分', { formula: 'SUM(G2:G2)' });
-mk(5, '今日已用', 0);
-mk(6, '还剩积分', REMAIN, true);
+mk(ws.getCell('K1'), ws.getCell('L1'), '累计总积分', { formula: 'SUM(G2:G2)' });
+mk(ws.getCell('K2'), ws.getCell('L2'), '今日已用', 0);
+mk(ws.getCell('K3'), ws.getCell('L3'), '还剩积分', REMAIN, true);
+ws.getColumn(11).width = 12; // K
+ws.getColumn(12).width = 12; // L
 
 fs.mkdirSync(path.dirname(OUT), { recursive: true });
 await wb.xlsx.writeFile(OUT);
 console.log(`[rebuild] 已生成 ${OUT}`);
 console.log('[rebuild] 行1 = 2026-10-01 00:16 ✅ 100 + 5 = 105（git 历史找回）');
-console.log('[rebuild] 小结：累计=SUM(G2:G2) 今日已用=0 还剩=' + REMAIN);
+console.log('[rebuild] 小结(K1:L3)：累计=SUM(G2:G2) 今日已用=0 还剩=' + REMAIN);
