@@ -1,0 +1,25 @@
+# 运行产物
+result.json
+
+# 依赖（由 npm ci 在 runner 上装）
+node_modules/
+
+# 凭证 —— 绝对不要提交
+*.token
+.token
+.env
+.env.*
+credentials*.json
+auth*.info
+.credentials*.json
+token.local.json
+.token-extract.log
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 注意：history/ 下的台账 Excel 是「要提交」的，故意不忽略。
+# 但演示文件不提交（含各种命名变体）。
+history/buddy-ledger-demo*.xlsx
+history/~$*.xlsx
