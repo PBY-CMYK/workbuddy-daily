@@ -89,7 +89,8 @@ jobs:
         continue-on-error: true
 
       - name: 推送到飞书
-        if: ${{ always() && secrets.FEISHU_WEBHOOK_URL != '' }}
+        # 注意：secrets 上下文不能用在 if: 条件里（workflow 解析会报
+        # Unrecognized named-value: 'secrets'）。改为脚本内部自行跳过。
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
