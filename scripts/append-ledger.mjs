@@ -8,7 +8,8 @@
  *       · 原 ✅ 行绝不会被 ❌ 覆盖（保护）
  *       · 重复签到保留原签到信息，只合并新增的领奖/派猫
  *   - 无「汇总」工作表（历史遗留的会自动删除）
- *   - 底部小结区三行：累计总积分 / 今日已用 / 还剩积分
+ *   - 积分小结区固定在 K1:L3（表格右上角，不随数据行增长移动）：
+ *     累计总积分 / 今日已用 / 还剩积分；旧版 A 列底部小结自动迁移
  *   - dry-run 的行会标注出来，不混入真实台账判断
  *
  * 用法：
@@ -201,13 +202,22 @@ function cellText(cell) {
   return String(v);
 }
 
-/** 找某日期已存在的行号（表头后第一行起，数据区不含底部小结区） */
+/** 找某日期已存在的行号（表头后第一行起，到数据区最后一行为止） */
 function findRowByDate(ws, date, limitRow) {
   const max = Math.min(limitRow || ws.rowCount, ws.rowCount);
   for (let i = 2; i <= max; i++) {
     if (cellText(ws.getRow(i).getCell(1)).trim() === date) return i;
   }
   return -1;
+}
+
+/** 数据区最后一行：从底往上找 A 列为日期的行（K 列小结在 1-3 行，不影响数据行号）。
+ *  不能用 ws.rowCount —— K3/L3 会把行数撑到 3，单行数据时会误判出空行。找不到返回 1（表头）。 */
+function findDataLastRow(ws) {
+  for (let i = ws.rowCount; i >= 2; i--) {
+    if (/^\d{4}-\d{2}-\d{2}$/.test(cellText(ws.getRow(i).getCell(1)).trim())) return i;
+  }
+  return 1;
 }
 
 /**
@@ -325,63 +335,99 @@ function styleRow(ws, rowNo, row, isDry) {
 }
 
 // ---------------------------------------------------------------------------
-// 底部小结区：累计总积分 / 今日已用 / 还剩积分
+// 积分小结区：K1:L3 固定右上角 —— 累计总积分 / 今日已用 / 还剩积分
+// （不随数据行增长移动；旧版 A 列底部小结自动迁移删除）
 // ---------------------------------------------------------------------------
 
 const SUMMARY_LABEL = '累计总积分';
-const SUMMARY_LABELS = [SUMMARY_LABEL, '今日已用', '还剩积分'];
 
-/** 找小结区起始行（A 列 = 「累计总积分」）；没有返回 -1 */
-function findSummaryStart(ws) {
+/** 旧版布局：小结在 A 列底部（返回起始行；没有返回 -1） */
+function findLegacySummaryStart(ws) {
   for (let i = 2; i <= ws.rowCount; i++) {
     if (cellText(ws.getRow(i).getCell(1)).trim() === SUMMARY_LABEL) return i;
   }
   return -1;
 }
 
-/** 读上一次快照的「还剩积分」值（必须在清小结区之前调用）；读不到返回 null */
+/** 读上一次快照的「还剩积分」值（必须在清小结区之前调用）；读不到返回 null。
+ *  新版在 K3/L3，旧版在 A 列小结第三行 B 列。 */
 function readPrevRemain(ws) {
-  const s = findSummaryStart(ws);
+  if (cellText(ws.getCell('K3')).trim() === '还剩积分') {
+    const v = cellText(ws.getCell('L3')).trim();
+    const n = Number(v);
+    return Number.isFinite(n) && v !== '' ? n : null;
+  }
+  const s = findLegacySummaryStart(ws);
   if (s < 0) return null;
   const v = cellText(ws.getRow(s + 2).getCell(2)).trim();
   const n = Number(v);
   return Number.isFinite(n) && v !== '' ? n : null;
 }
 
-/** 删除旧小结区（含前置空行）；返回删除的行数（0 = 本来就没有） */
-function clearSummaryRows(ws) {
-  const s = findSummaryStart(ws);
+/** 清空 K1:L3（值 + 样式），返回清掉的格数 */
+function clearKSummaryCells(ws) {
+  let n = 0;
+  for (const addr of ['K1', 'L1', 'K2', 'L2', 'K3', 'L3']) {
+    const c = ws.getCell(addr);
+    if (c.value !== null && c.value !== undefined) { c.value = null; n++; }
+    c.style = {}; // 连加粗/红色/蓝底一起清，避免残留
+  }
+  return n;
+}
+
+/** 删除旧版 A 列底部小结（含前置空行）；返回删除的行数（0 = 本来就没有）。
+ *  旧布局 → K 列布局的一次性迁移路径。
+ *  不用 ws.spliceRows：其「删除行」分支在删除区间之后没有其他行时，
+ *  只处理「删最后一行」特例，其余源行对象（值+样式）原样残留并被写出文件
+ *  （exceljs 源码自注 "same problem as row.splice, except worse"）。
+ *  这里改为逐行清值清样式 + 显式截短行槽数组（rowCount 即 _rows.length）。 */
+function clearLegacySummaryRows(ws) {
+  const s = findLegacySummaryStart(ws);
   if (s < 0) return 0;
   const start = s - 1 >= 2 ? s - 1 : s; // 连同前置空行一起删
   const count = ws.rowCount - start + 1;
-  if (count > 0) ws.spliceRows(start, count);
+  if (count <= 0) return 0;
+  for (let i = start; i < start + count; i++) {
+    const r = ws.getRow(i);
+    if (!r) continue;
+    r.eachCell({ includeEmpty: true }, (c) => { c.value = null; c.style = {}; });
+    r.style = {};
+  }
+  ws._rows.length = start - 1; // 截短：保留 1..start-1 行
   return count;
 }
 
 /**
- * 写底部小结区（数据行之后）：
- *   （空行）
- *   累计总积分 | =SUM(G2:G{last})     ← 公式，台账自算累计签到+领奖
- *   今日已用   | <数值 或 —>
- *   还剩积分   | <数值 或 —>          ← 实时余额快照
+ * 写 K 列小结区（固定 K1:L3，右上角）：
+ *   K1 累计总积分 | L1 =SUM(G2:G{last})   ← 公式，台账自算累计签到+领奖
+ *   K2 今日已用   | L2 <数值 或 —>
+ *   K3 还剩积分   | L3 <数值 或 —>        ← 实时余额快照（红字强调）
+ * K1/L1 用与表头一致的蓝底白字，小结第一行与表头带融为一体。
  */
 function writeSummaryBlock(ws, dataLastRow, { todayUsed, remain }) {
-  ws.getRow(dataLastRow + 1); // 空行占位
+  const white = { bold: true, color: { argb: 'FFFFFFFF' } };
+  const blue = (c) => { c.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF2F5597' } }; };
 
-  const mk = (rowNo, label, value, opts = {}) => {
-    const r = ws.getRow(rowNo);
-    r.getCell(1).value = label;
-    r.getCell(2).value = value;
-    r.getCell(1).font = { bold: true };
-    r.getCell(2).font = opts.accent
+  const mk = (labelCell, valueCell, label, value, accent = false) => {
+    labelCell.value = label;
+    valueCell.value = value;
+    labelCell.font = white;
+    blue(labelCell);
+    labelCell.alignment = { horizontal: 'center', vertical: 'middle' };
+    valueCell.font = accent
       ? { bold: true, size: 13, color: { argb: 'FFC00000' } }
       : { bold: true };
-    r.getCell(2).alignment = { horizontal: 'left', vertical: 'middle' };
+    blue(valueCell);
+    valueCell.alignment = { horizontal: 'left', vertical: 'middle' };
   };
 
-  mk(dataLastRow + 2, SUMMARY_LABEL, { formula: `SUM(${TOTAL_COL_LETTER}2:${TOTAL_COL_LETTER}${dataLastRow})` });
-  mk(dataLastRow + 3, '今日已用', todayUsed);
-  mk(dataLastRow + 4, '还剩积分', remain, { accent: true });
+  mk(ws.getCell('K1'), ws.getCell('L1'), SUMMARY_LABEL,
+    { formula: `SUM(${TOTAL_COL_LETTER}2:${TOTAL_COL_LETTER}${dataLastRow})` });
+  mk(ws.getCell('K2'), ws.getCell('L2'), '今日已用', todayUsed);
+  mk(ws.getCell('K3'), ws.getCell('L3'), '还剩积分', remain, true);
+
+  ws.getColumn(11).width = 12; // K
+  ws.getColumn(12).width = 12; // L
 }
 
 // ---------------------------------------------------------------------------
@@ -405,10 +451,12 @@ async function main() {
 
   // ---- 小结区：先读上次快照，再清掉（写完数据行后重写） ----------------
   const prevRemain = readPrevRemain(ws);
-  const cleared = clearSummaryRows(ws);
-  if (cleared > 0) console.log(`[ledger] 已清理旧小结区（${cleared} 行）`);
+  const clearedK = clearKSummaryCells(ws);
+  const clearedRows = clearLegacySummaryRows(ws);
+  if (clearedK > 0) console.log(`[ledger] 已清理 K 列旧小结（${clearedK} 格）`);
+  if (clearedRows > 0) console.log(`[ledger] 旧版 A 列小结已迁移删除（${clearedRows} 行）`);
 
-  const dataLastRow = Math.max(1, ws.rowCount); // 数据区最后一行（表头算第 1 行）
+  const dataLastRow = findDataLastRow(ws); // 数据区最后一行（表头算第 1 行）
   const existing = findRowByDate(ws, row.date, dataLastRow);
   let rowNo;
   let finalRow;
