@@ -10,6 +10,8 @@
  *   - 无「汇总」工作表（历史遗留的会自动删除）
  *   - 积分小结区固定在 K1:L3（表格右上角，不随数据行增长移动）：
  *     累计总积分 / 今日已用 / 还剩积分；旧版 A 列底部小结自动迁移
+ *   - 「今日已用」当日累加（同日重复记账/白天多次 sync 不丢账），
+ *     每天第一次记账（新行）时重置
  *   - dry-run 的行会标注出来，不混入真实台账判断
  *
  * 用法：
@@ -364,6 +366,39 @@ function readPrevRemain(ws) {
   return Number.isFinite(n) && v !== '' ? n : null;
 }
 
+/** 读上一次快照的「今日已用」值（必须在清小结区之前调用）；读不到返回 null。
+ *  同日重复记账时在旧值上累加，避免覆盖丢账；位置与 readPrevRemain 对称。 */
+function readPrevUsed(ws) {
+  if (cellText(ws.getCell('K2')).trim() === '今日已用') {
+    const v = cellText(ws.getCell('L2')).trim();
+    const n = Number(v);
+    return Number.isFinite(n) && v !== '' ? n : null;
+  }
+  const s = findLegacySummaryStart(ws);
+  if (s < 0) return null;
+  const v = cellText(ws.getRow(s + 1).getCell(2)).trim();
+  const n = Number(v);
+  return Number.isFinite(n) && v !== '' ? n : null;
+}
+
+/** 截掉末尾连续的空行槽。ExcelJS writeFile 会把内存里物化出来的空行
+ *  写成 <row> 空元素（幽灵行），读回后 rowCount 虚高、表格下方多空行。
+ *  从底往上找最后一个有值的行，把之后的行槽直接截短（rowCount 即 _rows.length）。 */
+function trimTrailingEmptyRows(ws) {
+  let end = ws.rowCount;
+  while (end >= 1) {
+    const r = ws.getRow(end);
+    if (!r) { end--; continue; }
+    let hasValue = false;
+    r.eachCell({ includeEmpty: true }, (c) => {
+      if (c.value !== null && c.value !== undefined) hasValue = true;
+    });
+    if (hasValue) break;
+    end--;
+  }
+  if (end < ws.rowCount) ws._rows.length = end;
+}
+
 /** 清空 K1:L3（值 + 样式），返回清掉的格数 */
 function clearKSummaryCells(ws) {
   let n = 0;
@@ -451,6 +486,7 @@ async function main() {
 
   // ---- 小结区：先读上次快照，再清掉（写完数据行后重写） ----------------
   const prevRemain = readPrevRemain(ws);
+  const prevUsed = readPrevUsed(ws);
   const clearedK = clearKSummaryCells(ws);
   const clearedRows = clearLegacySummaryRows(ws);
   if (clearedK > 0) console.log(`[ledger] 已清理 K 列旧小结（${clearedK} 格）`);
@@ -486,7 +522,10 @@ async function main() {
   let todayUsed = DASH;
   if (remainNow !== null) {
     const remainPrev = prevRemain !== null ? prevRemain : remainNow - gain;
-    todayUsed = round2(Math.max(0, remainPrev + gain - remainNow));
+    const inc = round2(Math.max(0, remainPrev + gain - remainNow));
+    // 口径（与 sync-ledger 一致）：同日重复记账在旧值上累加（手动重跑/多次
+    // sync 不丢账）；每天第一次记账（新行）直接用本次推算，实现跨天清零。
+    todayUsed = existing > 0 && prevUsed !== null ? round2(prevUsed + inc) : inc;
   }
 
   writeSummaryBlock(ws, rowNo, {
@@ -494,6 +533,7 @@ async function main() {
     remain: remainNow !== null ? remainNow : DASH,
   });
 
+  trimTrailingEmptyRows(ws);
   await wb.xlsx.writeFile(LEDGER_FILE);
 
   console.log(`[ledger] 已写入 ${LEDGER_FILE}（总 ${rowNo - 1} 天记录）`);
