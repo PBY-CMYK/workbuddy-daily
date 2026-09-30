@@ -1,0 +1,20 @@
+{
+  "name": "workbuddy-daily",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WorkBuddy「Buddy 加油站」每日签到 + 派猫猫旅行 自动化（GitHub Actions）",
+  "scripts": {
+    "checkin": "node scripts/checkin.mjs",
+    "notify": "node scripts/notify-feishu.mjs",
+    "ledger": "node scripts/append-ledger.mjs",
+    "ledger:demo": "node scripts/make-demo-ledger.mjs",
+    "probe": "node scripts/probe-cat.mjs",
+    "refresh-token": "node scripts/refresh-token.mjs",
+    "bat:check": "node local-sync/check-bat-eol.mjs",
+    "bat:repair": "node local-sync/repair-bat.mjs"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
