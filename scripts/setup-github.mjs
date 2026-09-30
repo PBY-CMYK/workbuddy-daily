@@ -33,22 +33,155 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '..');
 
 const API = 'https://api.github.com';
-const PAT = (process.env.GITHUB_PAT || '').trim();
 const argv = process.argv.slice(2);
+const INTERACTIVE = argv.includes('--interactive');
 const repoNameIdx = argv.indexOf('--repo-name');
-const REPO_NAME = (repoNameIdx >= 0 ? argv[repoNameIdx + 1] : '') || 'workbuddy-daily';
+const REPO_NAME_ARG = (repoNameIdx >= 0 ? argv[repoNameIdx + 1] : '') || '';
+let REPO_NAME = REPO_NAME_ARG || 'workbuddy-daily';
+let PAT = (process.env.GITHUB_PAT || '').trim();
 
 let dispatchTime = new Date(Date.now() - 8000).toISOString(); // 轮询起点（放宽 8s）
 
 const out = (...a) => console.log(...a);
 const outErr = (...a) => console.error(...a);
 
-if (!PAT && !argv.includes('--list')) {
+// ---------------------------------------------------------------------------
+// 错误兜底：必须注册在最前面。
+// 原因：本文件从第 260 行起是一串顶层 await。中途 fail() 抛错时，Node 会立刻
+// 检查"有没有 unhandledRejection 监听器"——如果监听器是文件末尾才挂上去的，
+// 那一刻还不存在，Node 就直接把原始堆栈打出来并崩掉，用户满屏英文看不懂。
+// 所以监听器必须早于任何 await 出现。handler 逻辑见文件末尾的 friendly() 调用点。
+// ---------------------------------------------------------------------------
+process.on('unhandledRejection', (e) => {
+  if (e && e.__setupFail) { process.exitCode = 2; return; } // fail() 已打印过原因
+  outErr(`\n[setup] ❌ 意外错误：${(e && e.message) || e}`);
+  const m = String((e && e.message) || e || '');
+  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(m)) {
+    outErr('   看起来是 DNS 解析失败：检查网络、代理或公司防火墙是否拦了 api.github.com。');
+  } else if (/ETIMEDOUT|ECONNRESET|UND_ERR|fetch failed/i.test(m)) {
+    outErr('   看起来是连接超时/被重置：换个网络重试，或稍后再试。');
+  } else if (/401|Bad credentials/i.test(m)) {
+    outErr('   Token 被 GitHub 拒绝：确认复制完整（ghp_ 开头），且勾了 repo + workflow。');
+  } else {
+    outErr('   把上面这段截图发我，我来判断。');
+  }
+  process.exitCode = 2;
+});
+process.on('uncaughtException', (e) => {
+  if (e && e.__setupFail) { process.exitCode = 2; return; }
+  outErr(`\n[setup] ❌ 意外错误：${(e && e.message) || e}`);
+  process.exitCode = 2;
+});
+
+if (!PAT && !INTERACTIVE && !argv.includes('--list')) {
   outErr('[setup] 缺少 GITHUB_PAT 环境变量。请双击 local-sync/配置GitHub.bat 运行。');
   process.exit(1);
 }
 if (PAT && !/^[A-Za-z0-9_]{2,}_[A-Za-z0-9]{20,}$/.test(PAT) && !PAT.startsWith('gh')) {
   outErr('[setup] Token 形态不像 GitHub PAT（应以 ghp_ / github_pat_ 开头），先继续试一把……');
+}
+
+// ---------------------------------------------------------------------------
+// 交互模式：说明、提问、记 Token 全部在 Node 里做。
+// 为什么不放 bat：cmd 在 chcp 65001 + set /p（交互输入）+ UTF-8 文件时，
+// 文件读指针会错位，后续行被从中间截断执行（'INPUT'/'ho' is not recognized）。
+// Node 的 readline 没有这些问题，中文显示也正常。
+// ---------------------------------------------------------------------------
+
+if (INTERACTIVE && !PAT) {
+  const os = await import('node:os');
+  const readline = await import('node:readline/promises');
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+
+  // ---------------------------------------------------------------------------
+  // 为什么要有 ask() 这层包装：
+  //
+  // 直接 rl.question() 在"交互终端"下没问题，但一旦 stdin 不是交互终端
+  // （管道、重定向、terminal 异常、被别的东西占了），question() 会永远悬空，
+  // Node 会打 "Detected unsettled top-level await" 再以奇怪状态退出。
+  //
+  // 实测：Windows 下 process.stdin 的 'end'/'close' 事件在这种场景并不触发，
+  // 靠事件判断行不通。所以改成"先听 line/close，用一个已完成标记 + 短超时"，
+  // 保证 ask() 一定会在有限时间内返回（拿不到就返回默认值）。
+  // ---------------------------------------------------------------------------
+  const pending = [];   // 已经读到的行
+  let eof = false;      // 是否已到输入末尾
+  rl.on('line', (l) => pending.push(l));
+  const onEnd = () => { eof = true; };
+  rl.on('close', onEnd);
+  process.stdin.on('end', onEnd);
+  process.stdin.on('close', onEnd);
+  process.stdin.on('error', onEnd);
+
+  // 等待一行输入：优先取队列；队列空且已 eof 就返回 null；否则最多等 ms 毫秒。
+  const readLine = (ms) => new Promise((resolve) => {
+    const t0 = Date.now();
+    const tick = () => {
+      if (pending.length) return resolve(pending.shift());
+      if (eof) return resolve(null);
+      if (Date.now() - t0 >= ms) return resolve(undefined); // 超时（无人输入）
+      setTimeout(tick, 20);
+    };
+    tick();
+  });
+
+  const ask = async (q, dflt = '') => {
+    process.stdout.write(q);
+    // 先给队列 + EOF 一点时间稳定（管道场景下数据几乎立刻到齐）
+    const ans = await readLine(120000);
+    if (ans === null || ans === undefined) {
+      // 没有输入（管道读完 / 超时）：走默认值
+      if (dflt) process.stdout.write('\n');
+      return dflt;
+    }
+    return String(ans).trim();
+  };
+
+  const patFile = path.join(os.homedir(), '.buddy-github-pat'); // 主目录，项目外，绝不入库
+
+  out('============================================================');
+  out('  Buddy 加油站 - GitHub 一键配置');
+  out('============================================================');
+  out('');
+  out('本程序将自动完成：建公开仓库 → 上传代码 → 写入 Secret → 触发首跑。');
+  out('');
+  out('你只需要先有一个 GitHub Token（没有就先用浏览器做两步，约 3 分钟）：');
+  out('  第 1 步  注册 GitHub：https://github.com/signup');
+  out('  第 2 步  生成 Token（repo / workflow 已自动勾选）：');
+  out('    https://github.com/settings/tokens/new?scopes=repo,workflow&description=buddy-daily');
+  out('    拉到页面最底部点 Generate token，复制 ghp_ 开头的字符串。');
+  out('');
+
+  let saved = '';
+  if (fs.existsSync(patFile)) saved = fs.readFileSync(patFile, 'utf8').trim();
+  if (saved) out(`检测到已保存的 Token（${saved.slice(0, 7)}…）：直接回车沿用，或粘贴新的覆盖。`);
+
+  const typed = await ask(saved ? 'Token（回车=沿用已保存）: ' : '把 Token 粘贴到这里后回车: ');
+  const val = typed || saved;
+  if (!val) {
+    out('');
+    out('[提示] Token 不能为空。');
+    out('  还没有 Token 就按上面两步先去网页操作，');
+    out('  拿到 ghp_ 开头的字符串后重新双击配置 bat。');
+    try { rl.close(); } catch { /* 已关就忽略 */ }
+    // 这里必须"停住"，否则会带着空 Token 继续往下走。
+    // 用 exitCode 而非 process.exit()：保证上面中文提示先 flush。
+    process.exitCode = 1;
+  } else {
+    PAT = val;
+    fs.writeFileSync(patFile, val + '\n');
+
+    const rn = await ask('仓库名（直接回车 = workbuddy-daily）: ');
+    if (rn) REPO_NAME = rn;
+    try { rl.close(); } catch { /* 已关就忽略 */ }
+    out('');
+  }
+}
+
+// 交互模式下用户没给 Token 就到此为止（exitCode 已置 1，见上面分支）。
+// 用一层总开关拦住后续所有网络步骤，避免拿着空 PAT 去请求 API。
+if (!PAT && !argv.includes('--list')) {
+  process.exitCode = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +213,11 @@ async function gh(method, urlPath, body) {
 
 function fail(msg) {
   outErr(`\n[setup] ❌ ${msg}`);
-  process.exit(2);
+  // 不用 process.exit(2)：Windows 上 stdout/stderr 是管道/控制台时可能还未 flush，
+  // 直接退出会吞掉上面几行中文提示。改用抛错 + 顶层 catch 统一置码（见文件末尾）。
+  const e = new Error(msg);
+  e.__setupFail = true;
+  throw e;
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +278,13 @@ if (argv.includes('--list')) {
   out(`--- 共 ${preview.length} 个文件`);
   process.exit(0);
 }
+
+// 交互模式下用户没给 Token：到此为止，不再往下走网络请求。
+// （用 exitCode 而非 process.exit，保证上面的中文提示先 flush 出去。）
+if (!PAT) {
+  outErr('[setup] 没有拿到 Token，已停止。');
+  process.exitCode = 1;
+} else {
 
 // ---------------------------------------------------------------------------
 // 1) 身份
@@ -317,7 +461,7 @@ if (runConclusion !== 'success') {
   outErr(`\n   ❌ 首跑结论：${runConclusion}`);
   outErr(`   看日志：${runUrl}`);
   outErr('   常见原因：WORKBUDDY_ACCESS_TOKEN 缺失/过期、网络抖动。修好后重跑本脚本即可（会自动跳过已完成步骤）。');
-  process.exit(2);
+  process.exitCode = 2; // 见 fail() 注释：不硬退，保证提示先 flush
 }
 out(`   ✅ 首跑成功！`);
 
@@ -355,3 +499,5 @@ out(`  Actions：https://github.com/${OWNER}/${REPO_NAME}/actions`);
 out(`  每天北京时间 09:00 自动执行（电脑关机也照跑）`);
 out(`  看台账：双击 local-sync/同步台账.bat`);
 out('==============================================');
+
+} // end if (PAT)
