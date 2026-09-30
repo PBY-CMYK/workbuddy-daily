@@ -211,5 +211,36 @@ console.log('\n场景 D：旧版 A 列底部小结 → 自动迁移 K 列（行�
   check('累计总积分是 SUM 公式', totalCell?.formula === 'SUM(G2:G3)', JSON.stringify(totalCell));
 }
 
+// ============ 场景 E：同日重复记账 → 今日已用累加（不覆盖丢账） ============
+console.log('\n场景 E：同日多次记账 → 今日已用 0→25.92→69.60 累加不丢');
+{
+  const f = path.join(TMP, 'E.xlsx');
+  fs.copyFileSync(SEED, f);
+  const idle = (remain, used) => base({
+    finishedAt: '2026-09-30T18:00:00Z',
+    checkin: { attempted: true, ok: true, alreadyCheckedIn: true, note: '今日已签到', credits: null, raw: null },
+    cat: {
+      travel: null,
+      claim: { attempted: false, ok: false, note: '未领取', raw: null },
+      dispatch: { attempted: false, ok: false, note: '—', state: null, dispatchedToday: null, locationId: null, arriveAt: null },
+    },
+    credit: { attempted: true, ok: true, total: 3505, remain, used, unit: 'credits', raw: null },
+  });
+  await runAppend(idle(1653.15, 1851.92), f);
+  let L = await readLedger(f);
+  let used = Number(L.cell(L.summary.usedRow, L.summary.valCol));
+  check('第1次记账：今日已用=25.92（快照差）', used === 25.92, String(used));
+  check('第1次记账：还剩=1653.15', Number(L.cell(L.summary.remainRow, L.summary.valCol)) === 1653.15, String(L.cell(L.summary.remainRow, L.summary.valCol)));
+  check('第1次记账：行数仍=1', L.rows.length === 1, `实际 ${L.rows.length}`);
+
+  await runAppend(idle(1609.47, 1895.6), f);
+  L = await readLedger(f);
+  used = Number(L.cell(L.summary.usedRow, L.summary.valCol));
+  check('第2次记账：今日已用=69.6（25.92+43.68 累加，不覆盖）', used === 69.6, String(used));
+  check('第2次记账：还剩=1609.47', Number(L.cell(L.summary.remainRow, L.summary.valCol)) === 1609.47, String(L.cell(L.summary.remainRow, L.summary.valCol)));
+  check('第2次记账：行数仍=1', L.rows.length === 1, `实际 ${L.rows.length}`);
+  check('第2次记账：签到积分仍=100', Number(L.rows[0]?.checkinCredits) === 100, String(L.rows[0]?.checkinCredits));
+}
+
 console.log(`\n===== 结果：${pass} 通过 / ${fail} 失败 =====`);
 process.exit(fail > 0 ? 1 : 0);
