@@ -1,0 +1,152 @@
+name: Buddy 加油站每日任务
+
+on:
+  schedule:
+    # 每天 01:00 UTC = 09:00 北京时间。GitHub 的 cron 走 UTC，注意换算。
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '干跑模式（只查询，不做任何写操作）'
+        type: boolean
+        default: false
+
+# 需要写权限：把台账 Excel 提交回仓库
+permissions:
+  contents: write
+
+concurrency:
+  group: buddy-daily
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 解释器路径不写死版本号：用 command -v 动态取
+      - name: 解析运行时路径
+        id: runtime
+        run: |
+          set -euo pipefail
+          echo "node=$(command -v node)" >> "$GITHUB_OUTPUT"
+          echo "node_version=$(node --version)" >> "$GITHUB_OUTPUT"
+
+      - name: 环境自检
+        run: |
+          set -euo pipefail
+          echo "node: ${{ steps.runtime.outputs.node }}"
+          echo "version: ${{ steps.runtime.outputs.node_version }}"
+          # 关键 secret 存在性检查（不打印明文）
+          [ -n "${{ secrets.WORKBUDDY_ACCESS_TOKEN }}" ] && echo "WORKBUDDY_ACCESS_TOKEN: present" || { echo "WORKBUDDY_ACCESS_TOKEN: MISSING"; exit 1; }
+          [ -n "${{ secrets.FEISHU_WEBHOOK_URL }}" ] && echo "FEISHU_WEBHOOK_URL: present" || echo "FEISHU_WEBHOOK_URL: missing (将跳过推送)"
+
+      # exceljs 用于写台账；版本锁在 package-lock.json 里
+      - name: 安装依赖
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            npm install --no-audit --no-fund
+          fi
+
+      - name: 执行签到与派猫猫旅行
+        id: run
+        env:
+          WORKBUDDY_ACCESS_TOKEN: ${{ secrets.WORKBUDDY_ACCESS_TOKEN }}
+          WORKBUDDY_USER_ID: ${{ secrets.WORKBUDDY_USER_ID }}
+          WORKBUDDY_ENDPOINT: ${{ vars.WORKBUDDY_ENDPOINT || 'https://copilot.tencent.com' }}
+          # 猫猫旅行走官网成长中心这一路，与签到不同 host
+          WORKBUDDY_WEB_ENDPOINT: ${{ vars.WORKBUDDY_WEB_ENDPOINT || 'https://www.workbuddy.cn' }}
+          # 可选：指定派猫地点 id；留空则自动取 config 的第一个
+          WORKBUDDY_TRAVEL_LOCATION_ID: ${{ vars.WORKBUDDY_TRAVEL_LOCATION_ID }}
+          WORKBUDDY_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          WORKBUDDY_RESULT_FILE: result.json
+        run: |
+          set -euo pipefail
+          node scripts/checkin.mjs
+        continue-on-error: true
+
+      # 追加一行到台账（history/buddy-ledger.xlsx）
+      - name: 写入每日台账 Excel
+        if: always()
+        env:
+          WORKBUDDY_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '0' }}
+          WORKBUDDY_RESULT_FILE: result.json
+          WORKBUDDY_LEDGER_FILE: history/buddy-ledger.xlsx
+        run: |
+          set -euo pipefail
+          if [ -f result.json ]; then
+            node scripts/append-ledger.mjs
+          else
+            echo "没有 result.json，跳过记账（说明脚本在写出结果前就失败了）"
+          fi
+        continue-on-error: true
+
+      - name: 推送到飞书
+        if: ${{ always() && secrets.FEISHU_WEBHOOK_URL != '' }}
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          WORKBUDDY_RESULT_FILE: result.json
+        run: |
+          set -euo pipefail
+          node scripts/notify-feishu.mjs
+        continue-on-error: true
+
+      # 把台账提交回仓库，这样你随时能翻历史
+      - name: 提交台账到仓库
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f history/buddy-ledger.xlsx ]; then
+            echo "没有台账文件，跳过提交"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history/buddy-ledger.xlsx
+          if git diff --cached --quiet; then
+            echo "台账无变化（同日重复跑），无需提交"
+            exit 0
+          fi
+          git commit -m "chore(ledger): $(date -u -d '+8 hours' +%F) 每日记录 [skip ci]"
+          # 并发场景下先 rebase 再推，避免 non-fast-forward
+          for i in 1 2 3; do
+            if git push; then echo "已提交"; exit 0; fi
+            echo "推送失败，第 $i 次重试……"
+            git pull --rebase --autostash || true
+          done
+          echo "::warning::台账提交失败（不影响今日任务结论）"
+        continue-on-error: true
+
+      - name: 汇总结论
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -f result.json ]; then
+            echo "----- result.json -----"
+            cat result.json
+          else
+            echo "没有产出 result.json（脚本可能在写出前就失败了）"
+          fi
+
+      # 签到成功即整体成功；签到失败才让 job 变红
+      - name: 判定最终状态
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f result.json ]; then
+            echo "::error::未产出结果文件"
+            exit 1
+          fi
+          if [ "$(node -e "console.log(require('./result.json').checkin.ok)")" != "true" ]; then
+            echo "::error::签到未成功"
+            exit 1
+          fi
+          echo "签到成功，任务视为成功（猫猫部分失败不影响）"
