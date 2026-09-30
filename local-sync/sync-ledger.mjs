@@ -33,7 +33,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import process from 'node:process';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -281,10 +281,34 @@ async function saveBuffer(cfg, buf, url) {
   return { ok: true, dest, changed: true, size: buf.length, url };
 }
 
-/** 用系统默认程序打开文件（Windows） */
+/**
+ * 找本地表格程序（Excel 优先，其次 WPS）。
+ * 不依赖 .xlsx 的 shell 关联——关联可能被接管/损坏（2026-10-01 实测：
+ * `start` 返回成功但表格不弹，而资源管理器双击正常）。
+ */
+function findSpreadsheetApp() {
+  const cands = [
+    'C:/Program Files/Microsoft Office/root/Office16/EXCEL.EXE',
+    'C:/Program Files (x86)/Microsoft Office/root/Office16/EXCEL.EXE',
+    'C:/Program Files/Microsoft Office/Office16/EXCEL.EXE',
+    'C:/Program Files (x86)/Microsoft Office/Office16/EXCEL.EXE',
+    path.join(process.env.LOCALAPPDATA || '', 'Kingsoft/WPS Office/office6/et.exe'),
+    'C:/Program Files/Kingsoft/WPS Office/office6/et.exe',
+    'C:/Program Files (x86)/Kingsoft/WPS Office/office6/et.exe',
+  ];
+  return cands.find((p) => p && fs.existsSync(p)) || null;
+}
+
+/** 打开台账：优先直接启动 Excel/WPS，找不到时退回系统默认关联 */
 function openFile(p) {
   try {
-    // start 是 cmd 内置命令，需要 shell
+    const app = findSpreadsheetApp();
+    if (app) {
+      // detached + unref：Excel 独立运行，不拖住 sync 进程
+      spawn(app, [p], { detached: true, stdio: 'ignore', windowsHide: false }).unref();
+      return;
+    }
+    // start 是 cmd 内置命令，需要 shell（兜底路径）
     execFile('cmd', ['/c', 'start', '""', p], { windowsHide: true }, () => {});
   } catch {
     /* 打开失败不影响同步 */
