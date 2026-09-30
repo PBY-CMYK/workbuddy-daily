@@ -30,6 +30,7 @@
  */
 
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
@@ -83,8 +84,27 @@ function rawUrl(cfg) {
   return `https://raw.githubusercontent.com/${cfg.repo}/${cfg.branch}/${cfg.remotePath}`;
 }
 
-/** 取远端文件元信息（存在性 + 大小 + 修改时间） */
+/** 取远端文件元信息（存在性 + 大小）。API 优先，失败退 raw。 */
 async function headRemote(cfg) {
+  // ---- 通道 1：Contents API（国内可达）----
+  try {
+    const rel = cfg.remotePath.split('/').map(encodeURIComponent).join('/');
+    const apiUrl = `https://api.github.com/repos/${cfg.repo}/contents/${rel}?ref=${encodeURIComponent(cfg.branch)}`;
+    const headers = { 'User-Agent': 'buddy-ledger-sync', Accept: 'application/vnd.github+json' };
+    const token = loadPat();
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(apiUrl, { headers });
+    if (res.ok) {
+      const j = await res.json().catch(() => null);
+      return { status: 200, ok: true, size: j?.size || 0, modified: '', url: apiUrl };
+    }
+    if (res.status === 404) {
+      return { status: 404, ok: false, size: 0, modified: '', url: apiUrl };
+    }
+    // 其它状态码 → 掉到 raw 探测
+  } catch { /* 掉到 raw */ }
+
+  // ---- 通道 2：raw HEAD ----
   const url = rawUrl(cfg);
   try {
     // 用 HEAD 拿头，避免下载整个文件
@@ -114,6 +134,70 @@ function netReason(e) {
   return code || 'unknown';
 }
 
+/** 可选 token：环境变量 GITHUB_PAT > ~/.buddy-github-pat（配置脚本保存的）。
+ *  只用来提高 API 速率上限（匿名 60 次/时 → 带 token 5000 次/时），
+ *  没有它也能拉公开仓库，只是配额低。绝不写进日志。 */
+function loadPat() {
+  const env = (process.env.GITHUB_PAT || '').trim();
+  if (env) return env;
+  try {
+    const p = path.join(os.homedir(), '.buddy-github-pat');
+    if (fs.existsSync(p)) {
+      const t = fs.readFileSync(p, 'utf8').trim();
+      if (t && /^gh[pousr]_/.test(t)) return t;
+    }
+  } catch { /* ignore */ }
+  return '';
+}
+
+/** 下载通道 1（国内首选）：GitHub Contents API，走 api.github.com。
+ *  为什么优先它：一键配置脚本刚用这个域名完成上传/触发/轮询，实测可达；
+ *  而 raw.githubusercontent.com 在国内常年被墙（连接被重置）。
+ *  文件 <1MB 时响应体直接带 base64 内容，台账 8KB 绰绰有余。 */
+async function apiDownload(cfg, token) {
+  const rel = cfg.remotePath.split('/').map(encodeURIComponent).join('/');
+  const url = `https://api.github.com/repos/${cfg.repo}/contents/${rel}?ref=${encodeURIComponent(cfg.branch)}`;
+  const headers = {
+    'User-Agent': 'buddy-ledger-sync',
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let res;
+  try {
+    res = await fetch(url, { headers });
+  } catch (e) {
+    return { ok: false, reason: 'network', net: netReason(e), url };
+  }
+  if (res.status === 404) return { ok: false, reason: 'notfound', url };
+  if (res.status === 401 || res.status === 403) {
+    // 带 token 被拒（401 失效 / 403 限流）→ 匿名再试一次（公开仓库不受 token 影响）
+    if (token) {
+      const anon = { ...headers };
+      delete anon.Authorization;
+      try {
+        const retry = await fetch(url, { headers: anon });
+        if (retry.ok) {
+          const j = await retry.json().catch(() => null);
+          if (j && j.content) {
+            const buf = Buffer.from(String(j.content).replace(/\s+/g, ''), 'base64');
+            return saveBuffer(cfg, buf, url);
+          }
+        }
+      } catch { /* 落到下面的错误返回 */ }
+    }
+    return { ok: false, reason: token ? 'api_auth' : 'api_ratelimit', url, status: res.status };
+  }
+  if (!res.ok) return { ok: false, reason: `http_${res.status}`, url };
+
+  const j = await res.json().catch(() => null);
+  if (!j || !j.content) return { ok: false, reason: 'api_no_content', url };
+  if (j.encoding !== 'base64') return { ok: false, reason: 'api_bad_encoding', url };
+  const buf = Buffer.from(String(j.content).replace(/\s+/g, ''), 'base64');
+  return saveBuffer(cfg, buf, url);
+}
+
 async function download(cfg) {
   const url = rawUrl(cfg);
   let res;
@@ -135,8 +219,12 @@ async function download(cfg) {
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
+  return saveBuffer(cfg, buf, url);
+}
 
-  // 空文件 / 非 xlsx（xlsx 是 zip，头两字节为 PK）→ 视为还没生成
+/** 校验内容并落盘（raw / API 两条通道共用）。
+ *  空文件 / 非 xlsx（xlsx 是 zip，头两字节为 PK）→ 视为还没生成。 */
+function saveBuffer(cfg, buf, url) {
   if (buf.length < 4) {
     return { ok: false, reason: 'empty', url };
   }
@@ -163,7 +251,12 @@ async function download(cfg) {
   } catch {
     // 目标被占用（Excel 开着）→ 换个带时间戳的名字
     const alt = path.join(cfg.localDir, cfg.localName.replace(/\.xlsx$/i, `_${Date.now()}.xlsx`));
-    fs.renameSync(tmp, alt);
+    try {
+      fs.renameSync(tmp, alt);
+    } catch {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      return { ok: false, reason: 'write_locked', url };
+    }
     return { ok: true, dest: alt, changed: true, size: buf.length, locked: dest, url };
   }
 
@@ -186,6 +279,7 @@ function openFile(p) {
 
 async function main() {
   const cfg = loadConfig();
+  const PAT = loadPat();
   log(`[sync] 仓库 ${cfg.repo}@${cfg.branch}`);
   log(`[sync] 远端 ${cfg.remotePath}`);
 
@@ -203,12 +297,17 @@ async function main() {
     return;
   }
 
-  const r = await download(cfg);
+  // 下载通道：API 优先（国内可达，配置脚本刚验证过），raw 兜底
+  let r = await apiDownload(cfg, PAT);
+  if (!r.ok && r.reason === 'network') {
+    log('[sync] API 通道连不上，改试 raw 直连……');
+    r = await download(cfg);
+  }
 
   if (!r.ok) {
     const NET_MSG = {
-      dns: '域名解析不了（raw.githubusercontent.com 被污染或断网）',
-      blocked: '连接被重置 —— 国内直连 GitHub raw 常被墙，需要挂代理',
+      dns: '域名解析不了（DNS 被污染或断网）',
+      blocked: '连接被重置 —— api.github.com 和 raw 都连不上，需要检查网络/代理',
       tls: 'HTTPS 握手失败（证书 / TLS 被拦截，通常是代理没设好）',
       unknown: '网络请求失败',
     }[r.net] || '网络请求失败';
@@ -216,17 +315,22 @@ async function main() {
     const msg = {
       network: NET_MSG,
       notfound: '远端还没有这个文件（说明任务还没成功跑过一次）',
-      private: '仓库是私有的，raw 地址拉不到 —— 需要改用带 token 的方式',
+      private: '仓库是私有的，匿名拉不到 —— 需要配置里带 token 的方式',
       empty: '远端文件是空的',
       not_xlsx: '拉到的不是 Excel 文件（可能是登录页 HTML）',
+      api_auth: 'Token 被 GitHub 拒绝（失效或没勾 repo 权限），匿名重试也没成功',
+      api_ratelimit: 'GitHub API 速率限制（匿名 60 次/小时）—— 等一会再试',
+      api_no_content: 'API 返回里没有文件内容',
+      api_bad_encoding: 'API 返回了未知编码',
+      write_locked: '本地文件被 Excel 占用且无法另存 —— 请关掉 Excel 再同步',
     }[r.reason] || `拉取失败：${r.reason}`;
 
     log(`[sync] ${msg}`);
     if (r.reason === 'network') {
       log('[sync] 建议：');
-      log('[sync]   1. 先确认浏览器能打开 https://raw.githubusercontent.com');
-      log('[sync]   2. 打不开就挂代理，或在系统里设 HTTPS_PROXY 环境变量');
-      log('[sync]   3. 实在拉不动，也可以直接在 GitHub 网页上下载 history/buddy-ledger.xlsx');
+      log('[sync]   1. 先确认浏览器能打开 https://github.com');
+      log('[sync]   2. 打不开就是断网/代理问题；打得开但脚本不行，设 HTTPS_PROXY 环境变量');
+      log('[sync]   3. 也可以直接在 GitHub 网页上下载 history/buddy-ledger.xlsx');
     }
     if (r.preview) log(`[sync] 响应片段：${r.preview.slice(0, 80)}`);
 
@@ -240,7 +344,7 @@ async function main() {
     log(`[sync] 已更新 → ${r.dest}（${(r.size / 1024).toFixed(1)} KB）`);
     if (r.locked) log(`[sync] 注意：${r.locked} 被占用，已另存为带时间戳的文件`);
   } else {
-    log(`[sync] 已是最新，无需更新（${(r.size / 1024).toFixed(1)} KB）`);
+    log(`[sync] 已是最新：${r.dest}（${(r.size / 1024).toFixed(1)} KB）`);
   }
 
   if (cfg.autoOpen && !NO_OPEN && !r.locked) {
