@@ -198,6 +198,35 @@ async function claimDailyCheckin() {
   return { ok: isBizOk(r), res: r, data: r?.json?.data ?? null };
 }
 
+/**
+ * 积分余额聚合（客户端「余额/档位/付费状态聚合」同款接口，POST 无业务参数）。
+ * 返回 Packages[]，每包含：
+ *   CycleTotalCapacity / CycleRemainCapacity / CycleUsedCapacity（字符串数字）
+ *   CapacityUnit（credits）/ PackageCode
+ * 客户端 sumSummaryCapacity 的口径：跨包求和 → total / remain / used。
+ */
+async function getCreditSummary() {
+  const r = await request('POST', '/billing/meter/get-user-resource-summary', { body: {} });
+  const ok = isBizOk(r);
+  let sum = null;
+  if (ok) {
+    const pkgs = Array.isArray(r?.json?.data?.Packages) ? r.json.data.Packages : [];
+    const toN = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const round2 = (n) => Math.round(n * 100) / 100;
+    sum = {
+      total: round2(pkgs.reduce((s, p) => s + toN(p?.CycleTotalCapacity), 0)),
+      remain: round2(pkgs.reduce((s, p) => s + toN(p?.CycleRemainCapacity), 0)),
+      used: round2(pkgs.reduce((s, p) => s + toN(p?.CycleUsedCapacity), 0)),
+      unit: pkgs[0]?.CapacityUnit || 'credits',
+      packages: pkgs.length,
+    };
+  }
+  return { ok, res: r, sum };
+}
+
 // --- 猫猫旅行（官网成长中心，base = www.workbuddy.cn）---------------------
 
 /** 可派地点配置 GET /activity/growth/buddy/travel/config */
@@ -386,7 +415,13 @@ export async function main() {
     ok: false,
     startedAt: startedAt.toISOString(),
     finishedAt: null,
-    checkin: { attempted: false, ok: false, note: '', credits: null, raw: null },
+    checkin: { attempted: false, ok: false, alreadyCheckedIn: false, note: '', credits: null, raw: null },
+    credit: {
+      // 积分余额快照（POST /billing/meter/get-user-resource-summary，客户端同款接口）
+      attempted: false, ok: false,
+      total: null, remain: null, used: null, unit: 'credits',
+      raw: null,
+    },
     cat: {
       travel: null,
       claim: { attempted: false, ok: false, note: '', raw: null },
@@ -400,13 +435,22 @@ export async function main() {
   };
 
   // ---- 0) 前置状态查询 -------------------------------------------------
+  // 注意字段名：接口返回的是 today_checked_in（布尔），不是 claimed_today。
+  // 预检命中「今日已签到」→ 直接标记 alreadyCheckedIn，步骤3 不再重复 POST。
+  // （此前中文报错「今天已签到，请明天再来」匹配不到英文正则，
+  //   且重复 POST 后台账把 ✅ 好行覆盖成 ❌，就是这里埋的雷。）
   try {
     const st = await getCheckinStatus();
     dumpRaw('checkin-status(before)', st.res);
     if (st.data) {
-      result.checkin.note = st.data.claimed_today ?? st.data.claimedToday
-        ? '今日已签到'
-        : '今日未签到';
+      const already = st.data.today_checked_in === true;
+      result.checkin.alreadyCheckedIn = already;
+      if (already) {
+        result.checkin.ok = true;
+        result.checkin.note = '今日已签到';
+      } else {
+        result.checkin.note = '今日未签到';
+      }
     }
   } catch (e) {
     logErr(`[warn] checkin-status 查询失败（不阻断）: ${e.message}`);
@@ -498,33 +542,61 @@ export async function main() {
 
   // ---- 3) 执行签到（猫猫部分失败也不影响这里） ------------------------
   try {
-    result.checkin.attempted = true;
-    if (DRY_RUN) {
-      result.checkin.ok = true;
-      result.checkin.note = 'dry-run：跳过实际签到';
+    if (result.checkin.alreadyCheckedIn) {
+      // 步骤0 预检已确认今天签过：跳过重复 POST，保持 ✅ 语义
+      // （不重复记积分，也不给台账制造「签到失败」假象）
+      result.checkin.attempted = false;
     } else {
-      const c = await claimDailyCheckin();
-      dumpRaw('daily-checkin', c.res);
-      result.checkin.raw = c.res?.json ?? null;
-      if (c.ok) {
-        const credits = c.data?.credits ?? c.data?.credit ?? c.data?.reward_credit ?? null;
+      result.checkin.attempted = true;
+      if (DRY_RUN) {
         result.checkin.ok = true;
-        result.checkin.credits = credits;
-        result.checkin.note = credits != null ? `签到成功，获得 ${credits} 积分` : '签到成功';
+        result.checkin.note = 'dry-run：跳过实际签到';
       } else {
-        const msg = bizMsg(c.res);
-        // 已经是领取态也算业务上「无需再签」，但结论应与真正失败区分开
-        if (/already|claimed/i.test(msg)) {
+        const c = await claimDailyCheckin();
+        dumpRaw('daily-checkin', c.res);
+        result.checkin.raw = c.res?.json ?? null;
+        if (c.ok) {
+          const credits = c.data?.credits ?? c.data?.credit ?? c.data?.reward_credit ?? null;
           result.checkin.ok = true;
-          result.checkin.note = `今日已签到（${msg}）`;
+          result.checkin.credits = credits;
+          result.checkin.note = credits != null ? `签到成功，获得 ${credits} 积分` : '签到成功';
         } else {
-          result.checkin.note = `签到失败：${msg}`;
+          const msg = bizMsg(c.res);
+          // 已经是领取态也算业务上「无需再签」，但结论应与真正失败区分开。
+          // 正则必须认中文：后端实际返回「今天已签到，请明天再来」（今天/明日 两种措辞都见过）
+          if (/already|claimed|已签到|明日再来|明天再来|重复/i.test(msg)) {
+            result.checkin.ok = true;
+            result.checkin.alreadyCheckedIn = true;
+            result.checkin.note = `今日已签到（${msg}）`;
+          } else {
+            result.checkin.note = `签到失败：${msg}`;
+          }
         }
       }
     }
   } catch (e) {
     result.checkin.note = `签到异常：${e.message}`;
     logErr(`[error] 签到异常: ${e.message}`);
+  }
+
+  // ---- 4) 查询积分余额（台账小结用；只读，失败不影响主结论） ----------
+  try {
+    result.credit.attempted = true;
+    const cs = await getCreditSummary();
+    dumpRaw('credit-summary', cs.res);
+    result.credit.raw = cs.res?.json ?? null;
+    if (cs.ok && cs.sum) {
+      result.credit.ok = true;
+      result.credit.total = cs.sum.total;
+      result.credit.remain = cs.sum.remain;
+      result.credit.used = cs.sum.used;
+      result.credit.unit = cs.sum.unit || 'credits';
+    } else {
+      result.credit.note = `余额查询失败：${bizMsg(cs.res)}`;
+    }
+  } catch (e) {
+    result.credit.note = `余额查询异常：${e.message}`;
+    logErr(`[warn] 积分余额查询异常（不影响签到）: ${e.message}`);
   }
 
   // ---- 收尾：签到成功即整体成功 ---------------------------------------
@@ -535,6 +607,9 @@ export async function main() {
   log(`签到 : ${result.checkin.ok ? '✅' : '❌'} ${result.checkin.note}`);
   log(`领奖 : ${result.cat.claim.ok ? '✅' : '⚠️'} ${result.cat.claim.note}`);
   log(`派猫 : ${result.cat.dispatch.note}`);
+  if (result.credit.ok) {
+    log(`积分 : 余额 ${result.credit.remain} / 总量 ${result.credit.total}（已用 ${result.credit.used} ${result.credit.unit}）`);
+  }
 
   return result;
 }
