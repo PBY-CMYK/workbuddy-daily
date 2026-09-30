@@ -528,6 +528,8 @@ function notify(text) {
 
 try {
   await main();
+  // fetch 的 keep-alive 连接会让进程多挂几秒才退，显式退出让 bat 窗口立即关闭
+  process.exit(0);
 } catch (e) {
   // 兜底：任何没预料到的异常都不要把 node 的堆栈直接糊到用户脸上
   console.error(`[sync] 出错了：${e?.message || e}`);
