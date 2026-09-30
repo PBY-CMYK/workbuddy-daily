@@ -195,7 +195,7 @@ async function apiDownload(cfg, token) {
   if (!j || !j.content) return { ok: false, reason: 'api_no_content', url };
   if (j.encoding !== 'base64') return { ok: false, reason: 'api_bad_encoding', url };
   const buf = Buffer.from(String(j.content).replace(/\s+/g, ''), 'base64');
-  return saveBuffer(cfg, buf, url);
+  return await saveBuffer(cfg, buf, url);
 }
 
 async function download(cfg) {
@@ -219,12 +219,18 @@ async function download(cfg) {
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
-  return saveBuffer(cfg, buf, url);
+  return await saveBuffer(cfg, buf, url);
 }
 
 /** 校验内容并落盘（raw / API 两条通道共用）。
- *  空文件 / 非 xlsx（xlsx 是 zip，头两字节为 PK）→ 视为还没生成。 */
-function saveBuffer(cfg, buf, url) {
+ *  空文件 / 非 xlsx（xlsx 是 zip，头两字节为 PK）→ 视为还没生成。
+ *  目标被 Excel/WPS 占用时重试若干次，仍失败就明确报错——
+ *  绝不另存「_时间戳」副本（用户要求：台账永远只有一份）。 */
+const SAVE_RETRIES = 3;
+const SAVE_RETRY_MS = 800;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function saveBuffer(cfg, buf, url) {
   if (buf.length < 4) {
     return { ok: false, reason: 'empty', url };
   }
@@ -243,21 +249,24 @@ function saveBuffer(cfg, buf, url) {
     }
   }
 
-  // 先写临时文件再原子替换，避免 Excel 正开着导致写坏
+  // 先写临时文件再原子替换，避免写坏
   const tmp = dest + '.tmp';
   fs.writeFileSync(tmp, buf);
-  try {
-    fs.renameSync(tmp, dest);
-  } catch {
-    // 目标被占用（Excel 开着）→ 换个带时间戳的名字
-    const alt = path.join(cfg.localDir, cfg.localName.replace(/\.xlsx$/i, `_${Date.now()}.xlsx`));
+
+  let renamed = false;
+  for (let i = 0; i < SAVE_RETRIES; i++) {
     try {
-      fs.renameSync(tmp, alt);
+      fs.renameSync(tmp, dest);
+      renamed = true;
+      break;
     } catch {
-      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-      return { ok: false, reason: 'write_locked', url };
+      // 多半是 Excel/WPS 还开着：等一下再试
+      if (i < SAVE_RETRIES - 1) await sleep(SAVE_RETRY_MS);
     }
-    return { ok: true, dest: alt, changed: true, size: buf.length, locked: dest, url };
+  }
+  if (!renamed) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    return { ok: false, reason: 'write_locked', url };
   }
 
   return { ok: true, dest, changed: true, size: buf.length, url };
@@ -342,14 +351,128 @@ async function main() {
 
   if (r.changed) {
     log(`[sync] 已更新 → ${r.dest}（${(r.size / 1024).toFixed(1)} KB）`);
-    if (r.locked) log(`[sync] 注意：${r.locked} 被占用，已另存为带时间戳的文件`);
   } else {
     log(`[sync] 已是最新：${r.dest}（${(r.size / 1024).toFixed(1)} KB）`);
   }
 
-  if (cfg.autoOpen && !NO_OPEN && !r.locked) {
+  // 同步成功后（打开之前）：实时刷新台账底部的「今日已用 / 还剩积分」
+  await refreshSummaryRows(r.dest);
+
+  if (cfg.autoOpen && !NO_OPEN) {
     log('[sync] 打开表格……');
     openFile(r.dest);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 实时积分小结刷新
+// ---------------------------------------------------------------------------
+
+const WB_ENDPOINT = 'https://copilot.tencent.com';
+
+/** 读本地登录态（workbuddy-daily/token.local.json，与本脚本同级目录的上一级） */
+function loadBuddyToken() {
+  const candidates = [
+    path.join(HERE, '..', 'token.local.json'),
+    path.join(HERE, 'token.local.json'),
+  ];
+  for (const p of candidates) {
+    try {
+      if (!fs.existsSync(p)) continue;
+      const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (j?.accessToken) return { token: j.accessToken, uid: j.uid || '' };
+    } catch { /* 试下一个 */ }
+  }
+  return null;
+}
+
+/** 查询积分余额：POST /billing/meter/get-user-resource-summary（客户端同款聚合接口） */
+async function fetchCreditRemain(t) {
+  const headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${t.token}`,
+    'X-Product-Code': 'workbuddy',
+    'X-Client-Platform': 'web',
+    'User-Agent': 'buddy-ledger-sync/1.0',
+  };
+  if (t.uid) headers['X-User-Id'] = t.uid;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch(`${WB_ENDPOINT}/billing/meter/get-user-resource-summary`, {
+      method: 'POST', headers, body: '{}', signal: ctrl.signal,
+    });
+    const j = await res.json().catch(() => null);
+    if (!j || j.code !== 0) return null;
+    const pkgs = Array.isArray(j?.data?.Packages) ? j.data.Packages : [];
+    const toN = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+    const remain = Math.round(pkgs.reduce((s, p) => s + toN(p?.CycleRemainCapacity), 0) * 100) / 100;
+    const total = Math.round(pkgs.reduce((s, p) => s + toN(p?.CycleTotalCapacity), 0) * 100) / 100;
+    return pkgs.length ? { remain, total } : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * 刷新台账底部小结区的「今日已用 / 还剩积分」：
+ *   还剩积分   ← 实时余额（get-user-resource-summary 汇总）
+ *   今日已用   ← 上次快照还剩 - 当前还剩（本地不签到，消耗只会让余额变小；
+ *                 差值为负说明中间有别的入账，按 0 处理）
+ * 任何一步失败都只提示、不阻断（台账本身已经同步成功了）。
+ */
+async function refreshSummaryRows(dest) {
+  try {
+    if (!fs.existsSync(dest)) return;
+    const t = loadBuddyToken();
+    if (!t) {
+      log('[sync] 未找到 token.local.json，跳过积分小结刷新（不影响台账）');
+      return;
+    }
+
+    const sum = await fetchCreditRemain(t);
+    if (!sum) {
+      log('[sync] 积分余额查询失败，台账小结保持上一次的值');
+      return;
+    }
+
+    const ExcelJS = (await import('exceljs')).default;
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.readFile(dest);
+    const ws = wb.getWorksheet('每日记录');
+    if (!ws) return;
+
+    // 找小结区（A 列 = 「累计总积分」）
+    let s = -1;
+    for (let i = 2; i <= ws.rowCount; i++) {
+      if (String(ws.getRow(i).getCell(1).value ?? '').trim() === '累计总积分') { s = i; break; }
+    }
+    if (s < 0) {
+      log('[sync] 台账里没有积分小结区，跳过刷新');
+      return;
+    }
+
+    // 布局：s=累计总积分，s+1=今日已用，s+2=还剩积分
+    const remainCell = ws.getRow(s + 2).getCell(2);
+    const usedCell = ws.getRow(s + 1).getCell(2);
+
+    const oldRemain = Number(remainCell.value);
+    let usedText = usedCell.value;
+    if (Number.isFinite(oldRemain)) {
+      const used = Math.max(0, Math.round((oldRemain - sum.remain) * 100) / 100);
+      usedText = used;
+    }
+    remainCell.value = sum.remain;
+    usedCell.value = usedText;
+
+    await wb.xlsx.writeFile(dest);
+    log(`[sync] 积分小结已刷新：还剩 ${sum.remain}（今日已用 ${usedText}）`);
+  } catch (e) {
+    log(`[sync] 积分小结刷新失败（不影响台账）：${e?.message || e}`);
   }
 }
 
