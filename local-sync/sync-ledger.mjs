@@ -265,8 +265,17 @@ async function saveBuffer(cfg, buf, url) {
     }
   }
   if (!renamed) {
-    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
-    return { ok: false, reason: 'write_locked', url };
+    // rename 反复失败：目标被无 FILE_SHARE_DELETE 权限的句柄占着
+    // （Defender/索引服务常见，未必真是 Excel 开着）。降级为直接覆盖写——
+    // 目标允许写时就能成功；Excel 真独占（deny-write）时仍失败并报错。
+    try {
+      fs.writeFileSync(dest, buf);
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      renamed = true;
+    } catch {
+      try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+      return { ok: false, reason: 'write_locked', url };
+    }
   }
 
   return { ok: true, dest, changed: true, size: buf.length, url };
@@ -426,6 +435,23 @@ async function fetchCreditRemain(t) {
  * 兼容旧版 A 列底部小结（s=累计总积分行 → s+1/s+2 的 B 列）。
  * 任何一步失败都只提示、不阻断（台账本身已经同步成功了）。
  */
+/** 截掉末尾连续的空行槽。ExcelJS writeFile 会把内存里物化出来的空行
+ *  写成 <row> 空元素（幽灵行），读回后 rowCount 虚高、表格下方多空行。 */
+function trimTrailingEmptyRows(ws) {
+  let end = ws.rowCount;
+  while (end >= 1) {
+    const r = ws.getRow(end);
+    if (!r) { end--; continue; }
+    let hasValue = false;
+    r.eachCell({ includeEmpty: true }, (c) => {
+      if (c.value !== null && c.value !== undefined) hasValue = true;
+    });
+    if (hasValue) break;
+    end--;
+  }
+  if (end < ws.rowCount) ws._rows.length = end;
+}
+
 async function refreshSummaryRows(dest) {
   try {
     if (!fs.existsSync(dest)) return;
@@ -470,12 +496,19 @@ async function refreshSummaryRows(dest) {
     const oldRemain = (raw === null || raw === undefined || raw === '') ? NaN : Number(raw);
     let usedText = usedCell.value;
     if (Number.isFinite(oldRemain)) {
-      const used = Math.max(0, Math.round((oldRemain - sum.remain) * 100) / 100);
-      usedText = used;
+      const inc = Math.max(0, Math.round((oldRemain - sum.remain) * 100) / 100);
+      const prevUsed = Number(usedCell.value);
+      // 白天多次同步：在旧「今日已用」上累加本次快照差（覆盖式会丢此前
+      // 已累计的消费）；余额没变时 inc=0，重复运行幂等。
+      // 跨天清零由每天第一次 append 记账重置。
+      usedText = Number.isFinite(prevUsed)
+        ? Math.round((prevUsed + inc) * 100) / 100
+        : inc;
     }
     remainCell.value = sum.remain;
     usedCell.value = usedText;
 
+    trimTrailingEmptyRows(ws);
     await wb.xlsx.writeFile(dest);
     log(`[sync] 积分小结已刷新：还剩 ${sum.remain}（今日已用 ${usedText}）`);
   } catch (e) {
