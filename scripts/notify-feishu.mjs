@@ -26,7 +26,12 @@ function die(msg) {
   process.exit(1);
 }
 
-if (!WEBHOOK) die('缺少 FEISHU_WEBHOOK_URL');
+if (!WEBHOOK) {
+  // 未配置 webhook 属于正常情况：安静跳过，不算失败（workflow 里已无 if: 守卫，
+  // 因为 secrets 上下文不能用于 if: 条件，见 daily.yml 注释）
+  console.log('[notify-feishu] 未配置 FEISHU_WEBHOOK_URL，跳过推送（不影响签到结果）');
+  process.exit(0);
+}
 
 if (!fs.existsSync(RESULT_FILE)) die(`找不到结果文件 ${RESULT_FILE}`);
 const r = JSON.parse(fs.readFileSync(RESULT_FILE, 'utf8'));
