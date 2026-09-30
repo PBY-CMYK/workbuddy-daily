@@ -1,0 +1,12 @@
+# 统一行尾，避免 Windows 下 .bat / .cmd 因 LF 行尾而静默失效
+* text=auto eol=lf
+
+# Windows 批处理必须 CRLF，否则 cmd.exe 会解析失败（双击无任何输出）
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制，别动
+*.xlsx binary
+*.xls binary
+*.png binary
+*.jpg binary
