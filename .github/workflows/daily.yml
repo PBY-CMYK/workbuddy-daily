@@ -42,7 +42,10 @@ jobs:
           echo "node: ${{ steps.runtime.outputs.node }}"
           echo "version: ${{ steps.runtime.outputs.node_version }}"
           # 关键 secret 存在性检查（不打印明文）
-          [ -n "${{ secrets.WORKBUDDY_ACCESS_TOKEN }}" ] && echo "WORKBUDDY_ACCESS_TOKEN: present" || { echo "WORKBUDDY_ACCESS_TOKEN: MISSING"; exit 1; }
+          # 优先看 refreshToken（长期滚动的那份）；只配了老 accessToken 也能跑，故不在此退出
+          [ -n "${{ secrets.WORKBUDDY_REFRESH_TOKEN }}" ] && echo "WORKBUDDY_REFRESH_TOKEN: present" || echo "WORKBUDDY_REFRESH_TOKEN: MISSING (将退回 WORKBUDDY_ACCESS_TOKEN 兜底)"
+          [ -n "${{ secrets.WORKBUDDY_ACCESS_TOKEN }}" ] && echo "WORKBUDDY_ACCESS_TOKEN: present" || echo "WORKBUDDY_ACCESS_TOKEN: missing (若 refreshToken 也没配则必然失败)"
+          [ -n "${{ secrets.GH_PAT }}" ] && echo "GH_PAT: present (refreshToken 可自动回写)" || echo "GH_PAT: missing (refreshToken 无法自动滚动，60 天后会再次失效)"
           [ -n "${{ secrets.FEISHU_WEBHOOK_URL }}" ] && echo "FEISHU_WEBHOOK_URL: present" || echo "FEISHU_WEBHOOK_URL: missing (将跳过推送)"
 
       # exceljs 用于写台账；版本锁在 package-lock.json 里
@@ -55,10 +58,23 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
+      # 令牌自动续期：accessToken 只有 30 天寿命，写死进 Secret 必然每月失效一次
+      # （2026-10-30 起连续两天签到 401 就是这个原因）。这里每天先用 refreshToken
+      # 换一张新 accessToken，通过 GITHUB_ENV 传给下游步骤。
+      - name: 令牌自动续期
+        id: token
+        env:
+          WORKBUDDY_REFRESH_TOKEN: ${{ secrets.WORKBUDDY_REFRESH_TOKEN }}
+          WORKBUDDY_ACCESS_TOKEN: ${{ secrets.WORKBUDDY_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/token-rotate.mjs
+
       - name: 执行签到与派猫猫旅行
         id: run
         env:
-          WORKBUDDY_ACCESS_TOKEN: ${{ secrets.WORKBUDDY_ACCESS_TOKEN }}
+          # 注意：不要在这里再写 WORKBUDDY_ACCESS_TOKEN: secrets.xxx，
+          # 否则会覆盖上一步续期导出的新令牌（env 优先级高于 GITHUB_ENV）。
           WORKBUDDY_USER_ID: ${{ secrets.WORKBUDDY_USER_ID }}
           WORKBUDDY_ENDPOINT: ${{ vars.WORKBUDDY_ENDPOINT || 'https://copilot.tencent.com' }}
           # 猫猫旅行走官网成长中心这一路，与签到不同 host
@@ -124,6 +140,27 @@ jobs:
             git pull --rebase --autostash || true
           done
           echo "::warning::台账提交失败（不影响今日任务结论）"
+        continue-on-error: true
+
+      # 回写新 refreshToken：续期接口每次都发一张新的（旧的作废），
+      # 不回写的话第二次运行就会 401 —— 这正是「每月失效一次」的根因。
+      - name: 回写新 refreshToken 到 Secret
+        if: always()
+        env:
+          GITHUB_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          F="$RUNNER_TEMP/new_refresh.txt"
+          if [ ! -f "$F" ]; then
+            echo "本次没有产生新 refreshToken，跳过回写"
+            exit 0
+          fi
+          if [ -z "${GITHUB_PAT:-}" ]; then
+            echo "::warning::没有 GH_PAT，refreshToken 无法滚动（60 天后会再次失效）"
+            exit 0
+          fi
+          node scripts/push-secret.mjs --repo "$GITHUB_REPOSITORY" --name WORKBUDDY_REFRESH_TOKEN --from-file "$F"
         continue-on-error: true
 
       - name: 汇总结论
