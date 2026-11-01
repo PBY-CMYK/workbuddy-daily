@@ -457,20 +457,91 @@ async function main() {
 
 const WB_ENDPOINT = 'https://copilot.tencent.com';
 
-/** 读本地登录态（workbuddy-daily/token.local.json，与本脚本同级目录的上一级） */
+/** 读本地登录态 token.local.json —— 按候选顺序取第一个存在的。
+ *  以后换令牌只要放到其中任一位置即可，路径不再写死在函数里。 */
 function loadBuddyToken() {
+  const home = process.env.USERPROFILE || process.env.HOME || '';
   const candidates = [
     path.join(HERE, '..', 'token.local.json'),
     path.join(HERE, 'token.local.json'),
+    path.join(HERE, '..', '..', '工具2', 'token.local.json'),
+    path.join(home, 'Desktop', 'token.local.json'),
+    // 旧路径兼容（最初安装位置）
+    'E:\\WorkBuddy\\2026-09-30-20-15-49\\workbuddy-daily\\token.local.json',
   ];
   for (const p of candidates) {
     try {
-      if (!fs.existsSync(p)) continue;
-      const j = JSON.parse(fs.readFileSync(p, 'utf8'));
-      if (j?.accessToken) return { token: j.accessToken, uid: j.uid || '' };
+      if (!p || !fs.existsSync(p)) continue;
+      const raw = fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''); // 兼容 VBA 续期写出的 BOM
+      const j = JSON.parse(raw);
+      if (j?.accessToken) return { token: j.accessToken, uid: j.uid || '', refresh: j.refreshToken || '', file: p };
     } catch { /* 试下一个 */ }
   }
   return null;
+}
+
+/** 解出 JWT 的 exp（秒）；解不出返回 0。用于在请求前就判定令牌是否过期，
+ *  避免把「令牌过期」误报成「网络/接口失败」。 */
+function jwtExp(token) {
+  try {
+    const p = String(token).split('.')[1];
+    if (!p) return 0;
+    const json = Buffer.from(p.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const m = json.match(/"exp"\s*:\s*(\d+)/);
+    return m ? Number(m[1]) : 0;
+  } catch { return 0; }
+}
+
+function fmtTs(sec) {
+  const d = new Date(sec * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** 用 refreshToken 换一张新的 accessToken，并写回 token.local.json。
+ *  为什么要有这一步：accessToken 只有 30 天寿命，过期后本机就只剩「令牌已过期」一句提示，
+ *  用户以为工具坏了（2026-10-30 云端、2026-11-1 本机都是这个坑）。
+ *  refreshToken 有 60 天且每次续期都滚动换新，服务端允许多副本并存（同一天内验证过：
+ *  旧 refreshToken 刷新两次都返回 200），所以本机这条链与云端 Actions 那条链互不影响。 */
+async function refreshLocalToken(t) {
+  if (!t?.refresh) return { ok: false, reason: '文件里没有 refreshToken' };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 12000);
+  try {
+    const res = await fetch('https://www.workbuddy.cn/v2/plugin/auth/token/refresh', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'X-Refresh-Token': t.refresh,
+        'X-Auth-Refresh-Source': 'plugin',
+        'Domain': 'www.workbuddy.cn',
+      },
+      body: '{}',
+      signal: ctrl.signal,
+    });
+    if (res.status !== 200) return { ok: false, reason: `HTTP ${res.status}` };
+    const j = await res.json().catch(() => null);
+    const d = j?.data ?? j;
+    const at = String(d?.accessToken ?? d?.access_token ?? '').trim();
+    const rt = String(d?.refreshToken ?? d?.refresh_token ?? '').trim();
+    if (!at) return { ok: false, reason: '返回里没有 accessToken' };
+
+    // 写回原文件：只替换两个令牌字段，uid/domain 等原样保留
+    const raw = fs.readFileSync(t.file, 'utf8').replace(/^\uFEFF/, '');
+    const obj = JSON.parse(raw);
+    const oldAt = obj.accessToken;
+    const oldRt = obj.refreshToken;
+    obj.accessToken = at;
+    if (rt) obj.refreshToken = rt;
+    fs.writeFileSync(t.file, JSON.stringify(obj, null, 2), 'utf8');
+
+    return { ok: true, token: { token: at, uid: t.uid, refresh: rt || t.refresh, file: t.file }, rotated: !!(rt && rt !== oldRt), replaced: at !== oldAt };
+  } catch (e) {
+    return { ok: false, reason: e.name === 'AbortError' ? '请求超时' : e.message };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** 查询积分余额：POST /billing/meter/get-user-resource-summary（客户端同款聚合接口） */
@@ -491,6 +562,8 @@ async function fetchCreditRemain(t) {
     const res = await fetch(`${WB_ENDPOINT}/billing/meter/get-user-resource-summary`, {
       method: 'POST', headers, body: '{}', signal: ctrl.signal,
     });
+    // 401/403 = 令牌过期或被拒，与网络故障要分开报，否则会一直查错方向
+    if (res.status === 401 || res.status === 403) return { authFail: res.status };
     const j = await res.json().catch(() => null);
     if (!j || j.code !== 0) return null;
     const pkgs = Array.isArray(j?.data?.Packages) ? j.data.Packages : [];
@@ -533,15 +606,49 @@ function trimTrailingEmptyRows(ws) {
 async function refreshSummaryRows(dest) {
   try {
     if (!fs.existsSync(dest)) return;
-    const t = loadBuddyToken();
+    let t = loadBuddyToken();
     if (!t) {
-      log('[sync] 未找到 token.local.json，跳过积分小结刷新（不影响台账）');
+      log('[sync] 未找到 token.local.json，跳过积分小结刷新（台账已正常更新）');
+      log('[sync] 想看余额：把 token.local.json 放到脚本目录或桌面，再双击一次');
       return;
     }
 
-    const sum = await fetchCreditRemain(t);
+    // 令牌过期时不再只报一句「已过期」，先自动续期（refreshToken 可滚动 60 天）
+    const exp = jwtExp(t.token);
+    if (exp && exp * 1000 < Date.now()) {
+      log(`[sync] 登录令牌已于 ${fmtTs(exp)} 过期 → 正在自动续期……`);
+      const r = await refreshLocalToken(t);
+      if (!r.ok) {
+        log(`[sync] 自动续期失败（${r.reason}）→ 余额不刷新，台账不受影响`);
+        log('[sync] → 换一份新的 token.local.json 即可恢复');
+        return;
+      }
+      t = r.token;
+      log(`[sync] ✅ 已自动续期，新令牌有效期至 ${fmtTs(jwtExp(t.token))}`);
+      log(`[sync] ✅ 新令牌已写回 ${t.file}`);
+    }
+
+    let sum = await fetchCreditRemain(t);
+    if (sum && sum.authFail) {
+      // 有效期看起来没过但接口仍 401（服务端提前吊销/时钟偏差）→ 续期后重试一次
+      log(`[sync] 余额接口返回 HTTP ${sum.authFail}（令牌被拒）→ 尝试自动续期后重试……`);
+      const r = await refreshLocalToken(t);
+      if (r.ok) {
+        t = r.token;
+        log(`[sync] ✅ 已续期（有效期至 ${fmtTs(jwtExp(t.token))}），重新查询余额`);
+        sum = await fetchCreditRemain(t);
+      } else {
+        log(`[sync] 自动续期失败（${r.reason}）→ 台账小结保持上一次的值`);
+        log('[sync] → 需要更新 token.local.json；台账本身已同步成功');
+        return;
+      }
+      if (sum && sum.authFail) {
+        log(`[sync] 续期后仍被拒（HTTP ${sum.authFail}），台账小结保持上一次的值`);
+        return;
+      }
+    }
     if (!sum) {
-      log('[sync] 积分余额查询失败，台账小结保持上一次的值');
+      log('[sync] 积分余额查询失败（网络或接口异常），台账小结保持上一次的值');
       return;
     }
 
