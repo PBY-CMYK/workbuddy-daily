@@ -15,6 +15,8 @@
     "bat:repair": "node local-sync/repair-bat.mjs"
   },
   "dependencies": {
-    "exceljs": "^4.4.0"
+    "blakejs": "^1.2.1",
+    "exceljs": "^4.4.0",
+    "tweetnacl": "^1.0.3"
   }
 }
